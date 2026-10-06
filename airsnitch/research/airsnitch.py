@@ -1002,6 +1002,13 @@ class Client2Client:
 			except Exception:
 				pass
 			self._orig_attacker_mac = None
+		# The attacker MAC is restored above, so it no longer impersonates the stolen
+		# (gateway/victim) MAC. Have the still-connected victim ARP the gateway now: its
+		# reply rebinds the AP forwarding table immediately, instead of the next test
+		# waiting minutes for the stale entry to age out. Must precede the victim stop().
+		if not self.poc and (self.options.c2c_port_steal is not None or
+		                     self.options.c2c_port_steal_uplink is not None):
+			self.recover_port_bindings()
 		if not self.poc:
 			self.sup_victim.stop()
 		self.sup_attacker.stop()
@@ -1031,15 +1038,21 @@ class Client2Client:
 		elif b"multicast_reflection" in raw(eth):
 			self.forward_ethernet = True
 			log(STATUS, f">>> Multicast Reflection is allowed ({identities}).", color="red")
-		elif self.options.c2c_ra_inject is not None and ICMPv6ND_RA in eth and ICMPv6NDOptRDNSS in eth \
+		elif (self.options.c2c_ra_inject is not None or self.options.c2c_gtk_inject is not None) \
+			and ICMPv6ND_RA in eth and ICMPv6NDOptRDNSS in eth \
 			and self.options.ra_inject_dns in [str(d) for d in eth[ICMPv6NDOptRDNSS].dns]:
 			# Our rogue ICMPv6 RA (matched by its attacker-controlled RDNSS) was
 			# received on the victim's interface -> the spoofed RA crossed client
-			# isolation and can swap the victim's IPv6 DNS resolver.
+			# isolation and can swap the victim's IPv6 DNS resolver. The gtk-inject
+			# RA payload (--gtk-inject-payload ra) carries the SAME RDNSS marker, so
+			# this branch must also fire during a gtk-inject run -- otherwise a forged
+			# RA that actually reached the victim is never detected and the verdict
+			# cannot be backed by a receipt.
 			self.forward_ethernet = True
 			log(STATUS, f">>> Rogue ICMPv6 RA reached the victim (RDNSS={self.options.ra_inject_dns}): "
 			            f"IPv6 RA/DNS injection NOT isolated ({identities}).", color="red")
-		elif self.options.c2c_dhcp_nak is not None and DHCP in eth and BOOTP in eth \
+		elif (self.options.c2c_dhcp_nak is not None or self.options.c2c_gtk_inject is not None) \
+			and DHCP in eth and BOOTP in eth \
 			and eth[BOOTP].xid == getattr(self, "_nak_xid", getattr(self.options, "gtk_inject_dhcp_xid", 0) or 0) \
 			and any(isinstance(o, tuple) and o[0] == "message-type" and o[1] in (6, "nak")
 			        for o in eth[DHCP].options):
@@ -1060,6 +1073,20 @@ class Client2Client:
 		# any marked frame reached the victim. Every sender/wait loop polls
 		# test_finished and halts immediately.
 		if self.forward_ethernet or self.forward_ip:
+			# For a GTK-inject run, emit ONE uniform receipt line for every payload
+			# (icmp/arp/dhcp-nak/ra) so the verdict is driven by proof of crossing --
+			# never by the shared-GTK precondition alone. Without this, payloads whose
+			# own branch above does not say "GTK wrapping" (ra/dhcp-nak/arp) produced
+			# no receipt line, and the scorer fell back to "GTKs identical" and called
+			# the cell VULNERABLE even when nothing reached the victim.
+			if self.options.c2c_gtk_inject is not None:
+				_kind = getattr(self.options, "gtk_inject_payload", "icmp") or "icmp"
+				log(STATUS, f">>> GTK wrapping {_kind} is allowed -- the forged GTK-encrypted group "
+				            f"frame crossed to the victim zone ({identities}).", color="red")
+			# Evidence: dump the exact frame that crossed to the victim's interface,
+			# so the log proves the attacker's marked packet was actually received
+			# (not inferred). This is the hard proof behind a VULNERABLE verdict.
+			log(STATUS, f">>> PROOF (frame received on the VICTIM): {eth.summary()}", color="red")
 			self.test_finished = True
 
 	def monitor_eth_port_steal(self, eth):
@@ -1067,6 +1094,7 @@ class Client2Client:
 
 		if (ICMP in eth and eth[ICMP].type == 0 and eth[Raw].load == b"1234567890") or (UDP in eth and eth[UDP].sport == self.options.iperf_port) :
 			log(STATUS, f">>> Downlink port stealing is successful.", color="red")
+			log(STATUS, f">>> PROOF (victim's downlink frame received by the ATTACKER): {eth.summary()}", color="red")
 			# Detected -> stop the flood immediately (both the sender loop and the
 			# event loops key off these).
 			self.port_steal_success = True
@@ -1127,6 +1155,7 @@ class Client2Client:
 	def monitor_eth_port_steal_uplink(self, eth):
 		if ICMP in eth and eth[ICMP].type == 8 and eth[Raw].load == b"uplink_steal_test" :
 			log(STATUS, f">>> Uplink port stealing is successful.", color="red")
+			log(STATUS, f">>> PROOF (victim's uplink frame received by the ATTACKER): {eth.summary()}", color="red")
 			self.port_steal_success = True
 			self.test_finished = True
 
@@ -1171,6 +1200,23 @@ class Client2Client:
 			log(STATUS, f">>> RESULT: {label} never reached the victim -- client isolation appears to BLOCK it ({identities}).", color="green")
 		if getattr(self.options, "auto_exit", False):
 			self.test_finished = True
+
+	def recover_port_bindings(self):
+		# After a port-steal, the AP/switch has a stolen MAC (the gateway's for uplink,
+		# the victim's for downlink) learned on the attacker's port. On a shared network
+		# that breaks the NEXT victim's connectivity for minutes until it ages out. Make
+		# the (clean) victim ARP the gateway now: the attacker holds the gateway's MAC but
+		# not its IP, so only the REAL gateway answers, and its reply -- arriving over the
+		# uplink -- makes the bridge immediately RE-LEARN the correct port. No aging wait.
+		try:
+			v = self.sup_victim
+			if v and getattr(v, "routerip", None) and getattr(v, "clientip", None):
+				for _ in range(8):
+					v.send_arp_request()
+					time.sleep(0.25)
+				log(STATUS, ">>> Recovery: victim ARPed the gateway to restore the AP forwarding table.", color="green")
+		except Exception as e:
+			log(STATUS, f">>> port-binding recovery skipped: {e}")
 
 	def send_c2c_frame(self):
 		# Option one: test forwarding at the IP level. send_eth will add Ethernet header.
